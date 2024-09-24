@@ -7,7 +7,7 @@ from tqdm import tqdm
 import os
 from PIL import Image
 import random
-
+import torch.nn.functional as F
 # ==============================
 # 1. 自定义数据集类
 # ==============================
@@ -107,43 +107,90 @@ def get_data_loaders(root_dir, batch_size=32, val_split=0.2):
 # ==============================
 # 3. YOLO 风格的分类模型
 # ==============================
-class SimpleYOLOLikeModel(nn.Module):
-    def __init__(self, num_classes=40):  # 将默认类别数改为40
-        super(SimpleYOLOLikeModel, self).__init__()
-        self.features = nn.Sequential(
-            # 第一组卷积层
-            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            # 第二组卷积层
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            # 第三组卷积层
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            # 第四组卷积层
-            nn.Conv2d(256, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-        )
-        self.classifier = nn.Sequential(
-            nn.Linear(512, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(512, num_classes)  # 输出层类别数为40
+
+class DilatedConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(DilatedConvBlock, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=2, dilation=2),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
         )
 
     def forward(self, x):
-        x = self.features(x)
+        return self.conv(x)
+
+
+class FPN(nn.Module):
+    def __init__(self, in_channels_list, out_channels):
+        super(FPN, self).__init__()
+        self.lateral_convs = nn.ModuleList([
+            nn.Conv2d(in_channels, out_channels, kernel_size=1) for in_channels in in_channels_list
+        ])
+        self.top_down_convs = nn.ModuleList([
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1) for _ in range(len(in_channels_list) - 1)
+        ])
+
+    def forward(self, inputs):
+        # 创建特征金字塔
+        laterals = [lateral_conv(x) for lateral_conv, x in zip(self.lateral_convs, inputs)]
+        # 逆序合并特征
+        for i in range(len(laterals) - 1, 0, -1):
+            laterals[i - 1] += nn.functional.interpolate(laterals[i], size=laterals[i - 1].shape[2:], mode='nearest')
+            laterals[i - 1] = self.top_down_convs[i - 1](laterals[i - 1])
+        return laterals[0]
+
+
+class SimpleYOLOLikeModel(nn.Module):
+    def __init__(self, num_classes=40):
+        super(SimpleYOLOLikeModel, self).__init__()
+
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(128)
+
+        self.dilated_conv1 = DilatedConvBlock(128, 256)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.dilated_conv2 = DilatedConvBlock(256, 512)
+
+        self.fpn = FPN([128, 256, 512], 256)
+
+        # 添加全局平均池化层
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        x1 = self.pool(self.relu(self.bn1(self.conv1(x))))  # 64通道
+        x2 = self.pool(self.relu(self.bn2(self.conv2(x1))))  # 128通道
+        x3 = self.dilated_conv1(x2)  # 256通道
+        x4 = self.dilated_conv2(x3)  # 512通道
+
+        # FPN期望的输入是不同阶段的特征图
+        fpn_output = self.fpn([x2, x3, x4])  # 传递适当的通道
+
+        # 进行全局平均池化以降低维度
+        x = self.adaptive_pool(fpn_output)  # 这里是 (batch_size, 256, 1, 1)
+        x = torch.flatten(x, 1)  # 转换为 (batch_size, 256)
+
         x = self.classifier(x)
         return x
+
+
+
+# 示例用法
+# model = ImprovedYOLOWithFPN(num_classes=40)
+# print(model)
 
 # ==============================
 # 4. 训练与验证函数
@@ -229,8 +276,8 @@ def main():
     # 配置参数
     root_dir = 'images'  # 数据集根目录
     batch_size = 32
-    num_epochs = 90
-    learning_rate = 0.00001
+    num_epochs = 100
+    learning_rate = 0.00000001
     checkpoint_path = 'checkpoint.pth'  # 检查点路径
     model_save_path = 'yolo_like_classification_model.pth'
     val_split = 0.2  # 20% 作为验证集
@@ -262,7 +309,8 @@ def main():
     # 检查是否存在检查点
     if os.path.exists(checkpoint_path):
         print(f'加载检查点 {checkpoint_path}...')
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
